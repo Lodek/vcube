@@ -1,108 +1,29 @@
-/* Simulador Vcube
- * Autor: Bruno Gomes
- * Data da ultima atualizacao: 2023-01-26
- * Funcionalidade: Simulador do algoritimo VCube usando biblioteca SMPL
- */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "smpl.h"
 #include "cisj.c"
-
-#define test 1
-#define fault 2
-#define recovery 3
-
-#define IS_EVEN(num) ((num % 2) == 0)
-
-#define IS_CORRECT(timestamp) ((timestamp % 2) == 0)
-#define IS_FAULTY(timestamp) (!IS_CORRECT(timestamp))
-
-typedef struct {
-    int id; // process id, eg simulated entity (aka facility)
-    int *states; // processes state vector
-    // indicates if process missed a round while crashed
-    int has_missed_test; 
-} ProcessFacility;
-
-typedef struct Args {
-    int process_count;
-    int scenario;
-} Args;
+#include "vcube.h"
 
 
-void test_cluster(int id, int s, ProcessFacility *processes, int process_count);
-void vcube_test(int id, ProcessFacility *processes, int process_count);
-int next_timestamp(int timestamp, int is_correct);
-void update_states(int process_count, int tester_id, int *tester_states, int *testee_states);
-int is_first_correct_process_in_cis(int tester, int target, int s, int *states);
-Args parse_args(int argc, char *argv[]);
-ProcessFacility* initialize(int process_count);
-void run_simm(ProcessFacility *processes, int process_count, float test_period, float deadline);
-int is_process_correct(ProcessFacility *processes, int id);
+static const char* CORRECT_STR = "CORRECT";
+static const char* FAULTY_STR = "FAULTY";
+static const char* FALSE_NEGATIVE_STR = "FALSE_NEGATIVE";
 
-
-int main(int argc, char *argv[]) {
-    Args args = parse_args(argc, argv);
-    ProcessFacility *processes = initialize(args.process_count);
-
-    switch (args.scenario) {
-        case 0:
-            schedule_scenario_0(args.process_count);
-            break;
-        case 1:
-            schedule_scenario_1(args.process_count);
-            break;
-        case 2:
-            schedule_scenario_2(args.process_count);
-            break;
-        default:
-            printf("unkown scenario %d!", args.scenario);
-            exit(1);
-    }
-
-    run_simm(processes, args.process_count, 10, 40);
-}
-
-void schedule_scenario_0(int process_count) {
-    for(int i=process_count/2; i<process_count; i++)
-        schedule(test, 0.0, i);
-}
-
-void schedule_scenario_1(int process_count) {
-    for(int i=0; i<process_count; i++)
-        schedule(test, 0.0, i);
-
-    // schedule process 2 to fail then crash every
-    // 10 units of time
-    for(int i=1; i<=5; i++) {
-        if (!IS_EVEN(i))
-            schedule(fault, 9.0*i, 2);
-        else
-            schedule(recovery, 9.0*i, 2);
-    }
-}
-
-void schedule_scenario_2(int process_count) {
-    // indefinitely crashes half the system
-    for(int i=process_count/2; i<process_count; i++)
-        schedule(fault, 0.0, i);
-
-    for(int i=0; i<process_count; i++)
-        schedule(test, 0.0, i);
-}
-
+#define SCHEDULE_TEST 1
 
 /*
  * run_simm acts as the simulator's event loop.
  * It sequentially consumes the events previously schedule in the smpl library and processes them accordingly.
  */
-void run_simm(ProcessFacility *processes, int process_count, float test_period, float deadline) {
-    printf("Starting vCube simmulation:\n");
-    printf("%d processes; test period = %.2f; deadline = %.2f\n", process_count, test_period, deadline);
-    printf("========================================================\n");
+SimmResult* run_simm(int process_count, double false_negative_probability,
+              double test_period, double deadline)
+{
+    Ctx ctx = initialize(process_count, false_negative_probability, test_period, deadline);
+    ProcessFacility *processes = ctx.processes;
 
     int token; // signals the process being currently executed
     int event; // last emitted event
@@ -110,74 +31,46 @@ void run_simm(ProcessFacility *processes, int process_count, float test_period, 
     while(time() < deadline) {
         cause(&event, &token);
         switch(event) {
-            case test: 
-                // break out of the switch as a crashed process cannot perform tests
-                if (!is_process_correct(processes, token)) {
-                    processes[token].has_missed_test = 1;
+            case SCHEDULE_TEST: 
+                // terminated process cannot perform tests
+                if (processes[token].has_terminated) {
                     break;
                 }
 
-                vcube_test(token, processes, process_count);
-                schedule(test, test_period, token);
+                vcube_test(ctx, token);
+                schedule(SCHEDULE_TEST, test_period, token);
 
-                printf("%4.1f: Process %d state: ", time(), token);
+                eprintf("%4.1f: Process %d state: ", time(), token);
                 for (int j = 0; j < process_count; j++) {
-                    printf("[%d]: %d, ", j, processes[token].states[j]);
+                    eprintf("[%d]: %d, ", j, processes[token].states[j]);
                 }
-                printf("\n");
-                break;
-            case fault:
-                request(processes[token].id, token, 0);
-                printf("%4.1f: Proccess %d failed!\n", time(), token);
-                break;
-            case recovery:
-                release(processes[token].id, token);
-                // if the process has missed a test, make it test
-                if (processes[token].has_missed_test) {
-                    processes[token].has_missed_test = 0;
-                    schedule(test, 0.0, token); 
-                }
-                printf("%4.1f: Process %d recovered!\n", time(), token);
+                eprintf("\n");
                 break;
         }
     }
+    // TODO free processes and their state vectors
+    ctx.result->remaining_processes -= ctx.result->termination_count;
+    return ctx.result;
 }
 
 
-/*
- * Parse command line arguments.
- * Expect a single integer argument representing the process count.
- * Return process count
- */
-Args parse_args(int argc, char *argv[]) {
-    if (argc < 2) {
-        puts("Usage: [process count] [scenario=0]");
-        exit(1);
-    }
-
-    int n = atoi(argv[1]);
-    int scenario = 0;
-    if (argc == 3)
-        scenario = atoi(argv[2]);
-    Args args = {n, scenario};
-    return args;
-}
 
 
 /*
  * Initialize smpl library, build facilities and processes.
  * Return pointer to allocated array of processes
  */
-ProcessFacility* initialize(int process_count) {
+Ctx initialize(int process_count, double fail_probability, double test_period, double max_time) {
 
     // smpl init
     smpl(0, "Simm. name");
     reset();
     stream(1);
+    
 
     ProcessFacility *processes = (ProcessFacility*) malloc(sizeof(ProcessFacility)*process_count);
     if(processes == NULL) {
-        printf("failed to allocate processes\n");
+        eprintf("failed to allocate processes\n");
         exit(1);
     }
 
@@ -189,20 +82,57 @@ ProcessFacility* initialize(int process_count) {
 
         int *states = (int*) malloc(sizeof(int)*process_count);
         if (states == NULL) {
-            printf("could not allocate states\n");
+            eprintf("could not allocate states\n");
             exit(1);
         }
 
         processes[i].states = states;
 
-        // initialize states to -1 for all processes other than self
+        // initialize states to 0 in order to stabalize system
         for (int j =0; j<process_count; j++) {
-            processes[i].states[j] = j == i ? 0 : -1;
+            // this could probably be optimized with calloc
+            processes[i].states[j] = 0;
         }
     }
-    return processes;
+
+    for(int i=0; i<process_count; i++) {
+        schedule(SCHEDULE_TEST, 0, i);
+    }
+
+    // Allocates one event per process per test interval
+    // This could be severely optimizaed by on demand allocation but it's good enough for now.
+    Event *events = (Event*) malloc(sizeof(Event)* process_count * (max_time / test_period));
+    if(events == NULL) {
+        eprintf("failed to allocate events\n");
+        exit(1);
+    }
+
+    SimmResult *result = (SimmResult*) malloc(sizeof(SimmResult));
+    if (result == NULL) {
+        eprintf("could not allocate SimmResult\n");
+        exit(1);
+    }
+
+    result->event_count = 0;
+    result->false_negative_count = 0;
+    result->test_count = 0;
+    result->termination_count = 0;
+    result->remaining_processes = process_count;
+    result->events = events;
+
+    Ctx ctx = {};
+    ctx.processes = processes;
+    ctx.process_count = process_count;
+    ctx.fail_probability = fail_probability;
+    ctx.result = result;
+
+    return ctx;
 }
 
+
+int is_tester_suspected(int process_count, int tester_id, int *testee_states) {
+    return IS_EVEN(testee_states[tester_id]) ? 0 : 1;
+}
 
 /*
  * update_states updates tester's states vector with
@@ -210,8 +140,6 @@ ProcessFacility* initialize(int process_count) {
  */
 void update_states(int process_count, int tester_id, int *tester_states, int *testee_states) {
     for (int i=0; i < process_count; i++) {
-        if (i == tester_id) continue;
-
         int ours = tester_states[i];
         int theirs = testee_states[i];
         if (theirs > ours) {
@@ -225,37 +153,27 @@ void update_states(int process_count, int tester_id, int *tester_states, int *te
  * next_timestamp return the updated timestamp for the given test result.
  * the returned timestamp is updated if a new event was detected.
  */
-int next_timestamp(int timestamp, int is_correct) {
-    // -1 means not initialized
-    if (timestamp == -1) {
-        // even numbers indicate the process is correct in the timestamp system
-        return is_correct ? 0 : 1;
-    }
-
+int next_timestamp(int timestamp, TestResult test_result) {
+    int is_correct = test_result == CORRECT ? 1 : 0;
     int inc = (IS_EVEN(timestamp) && is_correct) || (!IS_EVEN(timestamp) && !is_correct) ? 0 : 1;
     return timestamp + inc;
 }
 
-/*
- * Return 1 is process is up, 0 otherwise
- */
-int is_process_correct(ProcessFacility *processes, int id) {
-    // smpl status function returns 0 if the facility has been released
-    return status(processes[id].id) == 0;
-}
 
 /*
  * vcube_test is the public interface function for the vcube implementation.
  * it receives the tester's id, the list of processes and the process_count.
  * vcube_test sequentially tests all clusters for the given process.
  */
-void vcube_test(int id, ProcessFacility *processes, int process_count) {
-    printf("%4.1f: Test round for process %d\n", time(), id);
-    int cluster_count = (int) ceill(log2(process_count));
+void vcube_test(Ctx ctx, int id) {
+    eprintf("%4.1f: Test round for process %d\n", time(), id);
+    int cluster_count = (int) ceill(log2(ctx.process_count));
 
     for (int s=1; s <= cluster_count; s++) {
-        printf("%4.1f: Testing process %d, cluster %d\n", time(), id, s);
-        test_cluster(id, s, processes, process_count);
+        if (ctx.processes[id].has_terminated) break;
+
+        eprintf("%4.1f: Testing process %d, cluster %d\n", time(), id, s);
+        test_cluster(ctx, id, s);
     }
 }
 
@@ -264,23 +182,48 @@ void vcube_test(int id, ProcessFacility *processes, int process_count) {
  * For all correct processes tested, test_cluster updates the tester's state vector
  * by fetch missing events from the testee's event vector.
  */
-void test_cluster(int id, int s, ProcessFacility *processes, int process_count) {
-    for (int target=0; target < process_count; target++) {
-        if (is_first_correct_process_in_cis(id, target, s, processes[id].states)) {
-            int current = processes[id].states[target];
+void test_cluster(Ctx ctx, int id, int s) {
+    for (int target=0; target < ctx.process_count; target++) {
+        if (is_first_correct_process_in_cis(id, target, s, ctx.processes[id].states)) {
+            int current = ctx.processes[id].states[target];
 
-            int is_correct = is_process_correct(processes, target);
-            processes[id].states[target] = next_timestamp(current, is_correct);
-            if (is_correct) {
-                printf("%4.1f: %d -> %d: CORRECT\n", time(), id, target);
-                update_states(process_count, id, processes[id].states, processes[target].states);
+            TestResult result = test(ctx, ctx.processes[target].id);
+            ctx.result->test_count++;
+            if (result == FALSE_NEGATIVE) {
+                ctx.result->false_negative_count++;
+                log_event(ctx, FALSE_NEGATIVE_EVENT, "Process %d got a false negative for %d", id, target);
             }
-            else {
-                printf("%4.1f: %d -> %d: FAULTY\n", time(), id, target);
+
+            eprintf("%4.1f: %d -> %d: %s\n", time(), id, target, to_str(result));
+
+            ctx.processes[id].states[target] = next_timestamp(current, result);
+
+            if (result == CORRECT) {
+                if (is_tester_suspected(ctx.process_count, id, ctx.processes[target].states)) {
+                    eprintf("%4.1f: Process %d suspected as failed by process %d: Terminating\n", time(), id, target);
+                    log_event(ctx, SELF_TERMINATION, "Process %d terminated itself because process %d suspected it", id, target);
+                    ctx.processes[id].has_terminated = 1;
+                    ctx.result->termination_count++;
+                    request(ctx.processes[id].id, id, 0);
+                    return;
+                }
+                update_states(ctx.process_count, id, ctx.processes[id].states, ctx.processes[target].states);
             }
         }
     }
+}
 
+const char* to_str(TestResult test_result) {
+    switch (test_result) {
+        case CORRECT:
+            return CORRECT_STR;
+        case FAULTY:
+            return FAULTY_STR;
+        case FALSE_NEGATIVE:
+            return FALSE_NEGATIVE_STR;
+        default:
+            return NULL;
+    }
 }
 
 /*
@@ -309,4 +252,43 @@ int is_first_correct_process_in_cis(int tester, int target, int s, int *states) 
     }
     set_free(nodes);
     return result;
+}
+
+// Tests process `pid`.
+// test return a TestResult, indicating a correct process, an incorrect process of a false negative.
+// false negative probability is determined by simmulation parameters.
+TestResult test(Ctx ctx, int pid) {
+    // smpl status function returns 0 if the facility has been released
+    if (status(pid) == 1) {
+        return FAULTY;
+    } 
+
+    if (rand() % 100 <= ctx.fail_probability * 100) {
+        return FALSE_NEGATIVE;
+    }
+    else {
+        return CORRECT;
+    }
+}
+
+void log_event(Ctx ctx, EventType type, char *fmt, ...) {
+    char *msg = (char*) malloc(sizeof(char)*255);
+    if (msg == NULL) {
+        eprintf("malloc error");
+        exit(1);
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, 255, fmt, ap);
+    va_end(ap);
+
+    Event event = {};
+    event.type = type;
+    event.time = time();
+    event.msg = msg;
+
+    int *count = &ctx.result->event_count;
+    ctx.result->events[*count] = event;
+    *count = *count + 1;
 }
