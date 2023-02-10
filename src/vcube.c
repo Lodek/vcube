@@ -7,6 +7,7 @@
 #include "smpl.h"
 #include "cisj.c"
 #include "vcube.h"
+#include "rand_init.h"
 
 
 static const char* CORRECT_STR = "CORRECT";
@@ -67,6 +68,7 @@ Ctx initialize(int process_count, double fail_probability, double test_period, d
     reset();
     stream(1);
     
+    rand_init();
 
     ProcessFacility *processes = (ProcessFacility*) malloc(sizeof(ProcessFacility)*process_count);
     if(processes == NULL) {
