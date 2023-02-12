@@ -103,7 +103,7 @@ Ctx initialize(int process_count, double fail_probability, double test_period, d
 
     // Allocates one event per process per test interval
     // This could be severely optimizaed by on demand allocation but it's good enough for now.
-    Event *events = (Event*) malloc(sizeof(Event)* process_count * (max_time / test_period));
+    Event *events = (Event*) malloc(sizeof(Event)* process_count * 100 * (max_time / test_period));
     if(events == NULL) {
         eprintf("failed to allocate events\n");
         exit(1);
@@ -265,7 +265,7 @@ TestResult test(Ctx ctx, int pid) {
         return FAULTY;
     } 
 
-    if (rand() % 100 <= ctx.fail_probability * 100) {
+    if ((float)(rand() % 100) < ctx.fail_probability * 100.0) {
         return FALSE_NEGATIVE;
     }
     else {
